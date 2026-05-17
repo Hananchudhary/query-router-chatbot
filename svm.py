@@ -1,59 +1,169 @@
-import csv
-import pickle
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.svm import LinearSVC
-from sklearn.pipeline import Pipeline
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.metrics import classification_report, ConfusionMatrixDisplay
+import pandas as pd
 import matplotlib.pyplot as plt
 
-# Load dataset
-queries, labels = [], []
-with open('dataset.csv', encoding='utf-8') as f:
-    reader = csv.reader(f)
-    next(reader)
-    for row in reader:
-        queries.append(row[1])  # clean_text
-        labels.append(int(row[5]))
+df = pd.read_csv("/home/hanan/Projects/works/query-router/dataset.csv")
 
-X_train, X_test, y_train, y_test = train_test_split(
-    queries, labels, test_size=0.2, random_state=42, stratify=labels
-)
+df = df.dropna(subset=["clean_text", "label"])
 
-# Pipeline with TF-IDF + Linear SVM
-pipeline = Pipeline([
-    ('tfidf', TfidfVectorizer(
-        max_df=0.85, min_df=2, ngram_range=(1, 2), sublinear_tf=True
-    )),
-    ('clf', LinearSVC(class_weight='balanced', dual='auto', max_iter=10000))
+df["clean_text"] = df["clean_text"].astype(str)
+df["label"] = df["label"].astype(int)
+
+df["is_question"] = df["is_question"].astype(int)
+
+df["time"] = pd.to_datetime(df["time"], errors="coerce")
+
+df["hour"] = df["time"].dt.hour.fillna(0)
+df["dayofweek"] = df["time"].dt.dayofweek.fillna(0)
+df["is_weekend"] = df["dayofweek"].isin([5, 6]).astype(int)
+
+vocab = {}
+for text in df["clean_text"]:
+    for w in text.lower().split():
+        if w not in vocab:
+            vocab[w] = len(vocab)
+
+vocab_size = len(vocab)
+num_docs = len(df)
+
+X_text = np.zeros((num_docs, vocab_size))
+
+for i, text in enumerate(df["clean_text"]):
+    words = text.lower().split()
+
+    for w in words:
+        if w in vocab:
+            X_text[i, vocab[w]] += 1
+
+X_text = X_text / (np.sum(X_text, axis=1, keepdims=True) + 1e-8)
+
+df_count = np.sum(X_text > 0, axis=0)
+idf = np.log((1 + num_docs) / (1 + df_count)) + 1
+
+X_text = X_text * idf
+
+X_numeric = np.column_stack([
+    df["is_question"].values,
+    df["query_length"].values,
+    df["hour"].values,
+    df["dayofweek"].values,
+    df["is_weekend"].values
 ])
 
-# Grid search over C
-param_grid = {'clf__C': [0.01, 0.1, 1, 10]}
-grid = GridSearchCV(pipeline, param_grid, cv=5, scoring='accuracy', n_jobs=-1)
-grid.fit(X_train, y_train)
+mean = X_numeric.mean(axis=0)
+std = X_numeric.std(axis=0) + 1e-8
+X_numeric = (X_numeric - mean) / std
 
-print(f"Best C: {grid.best_params_['clf__C']}")
-print(f"Best CV accuracy: {grid.best_score_:.4f}")
-print()
+X = np.hstack([X_text, X_numeric])
+y = df["label"].values
 
-y_pred = grid.predict(X_test)
-acc = np.mean(y_pred == y_test)
-print(f"Test accuracy: {acc:.4f}")
-print()
-print(classification_report(y_test, y_pred, target_names=[
-    'chit-chat', 'coding-task', 'error', 'educational', 'conceptual-Q&A'
-]))
+num_classes = len(np.unique(y))
 
-# Confusion matrix
-fig, ax = plt.subplots(figsize=(6, 5))
-ConfusionMatrixDisplay.from_estimator(
-    grid, X_test, y_test, ax=ax,
-    display_labels=['chat', 'code', 'error', 'edu', 'concept'],
-    cmap='Blues', values_format='d'
+idx = np.arange(len(X))
+np.random.shuffle(idx)
+
+split = int(0.8 * len(X))
+
+train_idx = idx[:split]
+test_idx = idx[split:]
+
+X_train, X_test = X[train_idx], X[test_idx]
+y_train, y_test = y[train_idx], y[test_idx]
+
+class BinarySVM:
+
+    def __init__(self, lr=0.01, lambda_param=0.01, n_iters=300):
+
+        self.lr = lr
+        self.lambda_param = lambda_param
+        self.n_iters = n_iters
+
+        self.w = None
+        self.b = 0
+        self.loss_history = []
+
+    def compute_loss(self, X, y):
+
+        distances = 1 - y * (np.dot(X, self.w) - self.b)
+        hinge = np.maximum(0, distances)
+
+        return (
+            self.lambda_param * np.dot(self.w, self.w)
+            + np.mean(hinge)
+        )
+
+    def fit(self, X, y):
+
+        n_samples, n_features = X.shape
+
+        self.w = np.zeros(n_features)
+        self.b = 0
+
+        for epoch in range(self.n_iters):
+
+            for i, x_i in enumerate(X):
+
+                condition = y[i] * (np.dot(x_i, self.w) - self.b) >= 1
+
+                if condition:
+                    dw = 2 * self.lambda_param * self.w
+                    db = 0
+                else:
+                    dw = 2 * self.lambda_param * self.w - y[i] * x_i
+                    db = y[i]
+
+                self.w -= self.lr * dw
+                self.b -= self.lr * db
+
+            if epoch % 20 == 0:
+                self.loss_history.append(self.compute_loss(X, y))
+
+    def decision_function(self, X):
+        return np.dot(X, self.w) - self.b
+
+    def predict(self, X):
+        return np.sign(self.decision_function(X))
+
+class MultiClassSVM:
+
+    def __init__(self, n_classes, lr=0.01, lambda_param=0.01, n_iters=300):
+
+        self.n_classes = n_classes
+
+        self.models = [
+            BinarySVM(lr, lambda_param, n_iters)
+            for _ in range(n_classes)
+        ]
+
+    def fit(self, X, y):
+
+        for c in range(self.n_classes):
+
+            print(f"Training class {c} vs rest...")
+
+            y_binary = np.where(y == c, 1, -1)
+
+            self.models[c].fit(X, y_binary)
+
+    def predict(self, X):
+
+        scores = np.zeros((X.shape[0], self.n_classes))
+
+        for c, model in enumerate(self.models):
+
+            scores[:, c] = model.decision_function(X)
+
+        return np.argmax(scores, axis=1)
+
+model = MultiClassSVM(
+    n_classes=num_classes,
+    lr=0.01,
+    lambda_param=0.01,
+    n_iters=200
 )
-plt.title('Confusion Matrix')
-plt.tight_layout()
-plt.savefig('confusion_matrix.png', dpi=150)
-print("Saved confusion_matrix.png")
+
+model.fit(X_train, y_train)
+y_pred = model.predict(X_test)
+accuracy = np.mean(y_pred == y_test) * 100
+
+print(f"Test Accuracy: {accuracy:.2f}%")
