@@ -1,22 +1,17 @@
+!pip install gradio
 import pandas as pd
 import numpy as np
 import torch
 import re
-
+import gradio as gr
+from datetime import datetime
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-
-# =========================================================
-# DEVICE
-# =========================================================
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using Device: {device}")
-
-# =========================================================
-# LOAD DATA
-# =========================================================
 
 df = pd.read_csv("dataset.csv")
 
@@ -28,11 +23,8 @@ required_columns = [
     "label"
 ]
 
+labels = ["General", "Code Generation","Code Issues","Educational","Lookup"]
 df = df[required_columns].dropna()
-
-# =========================================================
-# PREPROCESSING
-# =========================================================
 
 STOPWORDS = {
     "the","a","an","is","are","to","of","in","on","for","and","or",
@@ -62,20 +54,12 @@ def preprocess_dataframe(df):
 
 df = preprocess_dataframe(df)
 
-# =========================================================
-# TRAIN / TEST SPLIT (NEW)
-# =========================================================
+df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 
-train_df, test_df = train_test_split(
-    df,
-    test_size=0.2,
-    random_state=42,
-    stratify=df["label"]
-)
+split_idx = int(0.8 * len(df))
 
-# =========================================================
-# VOCABULARY
-# =========================================================
+train_df = df.iloc[:split_idx].reset_index(drop=True)
+test_df = df.iloc[split_idx:].reset_index(drop=True)
 
 MAX_VOCAB_SIZE = 2000
 MIN_WORD_FREQ = 2
@@ -97,10 +81,6 @@ filtered_words = filtered_words[:MAX_VOCAB_SIZE]
 vocab = {word: idx for idx, (word, _) in enumerate(filtered_words)}
 print(f"Vocabulary Size: {len(vocab)}")
 
-# =========================================================
-# IDF
-# =========================================================
-
 num_docs = len(train_df)
 vocab_size = len(vocab)
 
@@ -116,10 +96,6 @@ for text in train_df["clean_text"]:
                 seen.add(idx)
 
 idf = np.log((1 + num_docs) / (1 + df_counts)) + 1
-
-# =========================================================
-# TF-IDF
-# =========================================================
 
 def vectorize_text(df):
     X = np.zeros((len(df), vocab_size))
@@ -142,10 +118,6 @@ def vectorize_text(df):
 X_train_text = vectorize_text(train_df)
 X_test_text = vectorize_text(test_df)
 
-# =========================================================
-# NUMERIC FEATURES
-# =========================================================
-
 features = ["is_question", "query_length", "hour", "dayofweek", "is_weekend"]
 
 X_train_numeric = train_df[features].values
@@ -157,29 +129,17 @@ std = X_train_numeric.std(axis=0) + 1e-8
 X_train_numeric = (X_train_numeric - mean) / std
 X_test_numeric = (X_test_numeric - mean) / std
 
-# =========================================================
-# FINAL FEATURES
-# =========================================================
-
 X_train = np.hstack([X_train_text, X_train_numeric])
 X_test = np.hstack([X_test_text, X_test_numeric])
 
 y_train = train_df["label"].values
 y_test = test_df["label"].values
 
-# =========================================================
-# TORCH TENSORS
-# =========================================================
-
 X_train = torch.tensor(X_train, dtype=torch.float32)
 X_test = torch.tensor(X_test, dtype=torch.float32)
 
 y_train = torch.tensor(y_train, dtype=torch.long)
 y_test = torch.tensor(y_test, dtype=torch.long)
-
-# =========================================================
-# DATASET
-# =========================================================
 
 class QueryIntentDataset(Dataset):
     def __init__(self, X, y):
@@ -195,18 +155,10 @@ class QueryIntentDataset(Dataset):
 train_dataset = QueryIntentDataset(X_train, y_train)
 test_dataset = QueryIntentDataset(X_test, y_test)
 
-# =========================================================
-# DATALOADER
-# =========================================================
-
 BATCH_SIZE = 16
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-# =========================================================
-# MODEL
-# =========================================================
 
 class QueryIntentANN(nn.Module):
     def __init__(self, input_size):
@@ -230,10 +182,6 @@ class QueryIntentANN(nn.Module):
 model = QueryIntentANN(X_train.shape[1]).to(device)
 print(model)
 
-# =========================================================
-# LOSS + OPTIMIZER
-# =========================================================
-
 loss_fn = nn.CrossEntropyLoss()
 
 optimizer = torch.optim.Adam(
@@ -242,17 +190,9 @@ optimizer = torch.optim.Adam(
     weight_decay=0.01
 )
 
-# =========================================================
-# ACCURACY
-# =========================================================
-
 def accuracy_fn(y_true, y_pred):
     correct = (y_true == y_pred).sum().item()
     return (correct / len(y_pred)) * 100
-
-# =========================================================
-# TRAIN STEP
-# =========================================================
 
 def train_step():
     model.train()
@@ -275,10 +215,6 @@ def train_step():
 
     return total_loss / len(train_loader), total_acc / len(train_loader)
 
-# =========================================================
-# TEST STEP
-# =========================================================
-
 def test_step():
     model.eval()
     total_loss, total_acc = 0, 0
@@ -297,10 +233,6 @@ def test_step():
 
     return total_loss / len(test_loader), total_acc / len(test_loader)
 
-# =========================================================
-# TRAINING LOOP
-# =========================================================
-
 EPOCHS = 10
 
 for epoch in range(EPOCHS):
@@ -311,10 +243,6 @@ for epoch in range(EPOCHS):
     print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
     print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}%")
 
-# =========================================================
-# FINAL EVALUATION
-# =========================================================
-
 model.eval()
 
 with torch.inference_mode():
@@ -322,5 +250,79 @@ with torch.inference_mode():
     preds = torch.argmax(logits, dim=1)
 
     final_acc = accuracy_fn(y_test.to(device), preds)
+    cm = confusion_matrix(
+        y_test.to(device).numpy(),
+        preds.to(device).numpy()
+    )
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+disp.plot(cmap="Blues", xticks_rotation=45)
 
+plt.title("Confusion Matrix - Query Intent Classifier")
+plt.show()
 print(f"\nFinal Test Accuracy: {final_acc:.2f}%")
+
+def get_numeric_features(text):
+    now = datetime.now()
+
+    hour = now.hour
+    dayofweek = now.weekday()
+    is_weekend = 1 if dayofweek in [5, 6] else 0
+
+    return np.array([
+        1 if "?" in text else 0,
+        len(text.split()),
+        hour,
+        dayofweek,
+        is_weekend
+    ])
+
+def vectorize(text):
+    words = clean_sentence(text)
+
+    x_text = np.zeros(vocab_size)
+    tf_counts = {}
+
+    for w in words:
+        if w in vocab:
+            idx = vocab[w]
+            tf_counts[idx] = tf_counts.get(idx, 0) + 1
+
+    for idx, count in tf_counts.items():
+        tf = count / max(len(words), 1)
+        x_text[idx] = tf * idf[idx]
+
+    return x_text
+
+
+def preprocess_input(text):
+    x_text = vectorize(text)
+    x_num = get_numeric_features(text)
+
+    x_num = (x_num - mean) / (std + 1e-8)
+
+    x = np.hstack([x_text, x_num])
+    return torch.tensor(x, dtype=torch.float32).unsqueeze(0).to(device)
+
+
+def predict(query):
+    x = preprocess_input(query)
+
+    with torch.inference_mode():
+        logits = model(x)
+        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+        pred_class = int(np.argmax(probs))
+
+    return {
+        "Predicted Class": labels[pred_class],
+        "Confidence": float(np.max(probs))
+    }
+
+interface = gr.Interface(
+    fn=predict,
+    inputs=gr.Textbox(lines=2, placeholder="Enter your query..."),
+    outputs=gr.JSON(),
+    title="🧠 Query Intent Classifier",
+    description="Enter a query and the model predicts its intent class."
+)
+
+interface.launch()
