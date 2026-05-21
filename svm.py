@@ -1,10 +1,12 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import gradio as gr
 
 df = pd.read_csv("/home/hanan/Projects/works/query-router/dataset.csv")
 
 df = df.dropna(subset=["clean_text", "label"])
+labels = ["General", "Code Generation","Code Issues","Educational","Lookup"]
 
 df["clean_text"] = df["clean_text"].astype(str)
 df["label"] = df["label"].astype(int)
@@ -167,3 +169,64 @@ y_pred = model.predict(X_test)
 accuracy = np.mean(y_pred == y_test) * 100
 
 print(f"Test Accuracy: {accuracy:.2f}%")
+
+def build_features(text, is_question, query_length, hour, dayofweek):
+
+    x_text = np.zeros(vocab_size)
+
+    words = text.lower().split()
+
+    for w in words:
+        if w in vocab:
+            x_text[vocab[w]] += 1
+
+    x_text = x_text / (np.sum(x_text) + 1e-8)
+    x_text = x_text * idf
+
+    is_weekend = 1 if dayofweek in [5, 6] else 0
+
+    x_num = np.array([
+        is_question,
+        query_length,
+        hour,
+        dayofweek,
+        is_weekend
+    ])
+
+    x_num = (x_num - mean) / std
+
+    x = np.hstack([x_text, x_num])
+
+    return x.reshape(1, -1)
+
+def predict_query(text, is_question, hour, dayofweek):
+
+    query_length = len(text.split())
+
+    x = build_features(
+        text,
+        int(is_question),
+        query_length,
+        int(hour),
+        int(dayofweek)
+    )
+
+    pred = model.predict(x)[0]
+
+    return labels[pred]
+
+# ---------- Gradio UI ----------
+iface = gr.Interface(
+    fn=predict_query,
+    inputs=[
+        gr.Textbox(label="Query Text"),
+        gr.Checkbox(label="Is Question?"),
+        gr.Slider(0, 23, step=1, label="Hour"),
+        gr.Slider(0, 6, step=1, label="Day Of Week (0=Mon)")
+    ],
+    outputs="text",
+    title="Query Router SVM Classifier",
+    description="Predict query class using custom multiclass SVM."
+)
+
+iface.launch()
